@@ -1,0 +1,306 @@
+"""
+Agent 工具函数集合（基于 LangChain @tool）。
+
+本模块提供以下工具：
+1. check_pk_tool
+   - 校验指定表的逻辑主键是否唯一且非空
+2. check_volume_tool
+   - 对比 t 日与 t-1 日两天的数据量，判断是否出现异常波动
+3. query_table_metadata_tool
+   - 查询 SQLite 表结构信息（字段名、数据类型等）
+4. rag_definition_tool
+   - 基于 ChromaDB 的业务口径知识库检索（RAG）
+"""
+
+import re
+from typing import List
+
+from langchain_core.tools import tool
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+from config import config
+
+
+# --- 数据库与向量库基础设施 ----------------------------------------------------
+
+_engine: Engine | None = None
+_chroma: Chroma | None = None
+
+
+def get_sqlite_engine() -> Engine:
+    """
+    获取 SQLite Engine（单例）。
+
+    说明：
+    - 使用 config.SQLITE_DB_URL 作为连接 URL
+    - 由于 SQLite 是本地文件数据库，本 Demo 直接使用同一个连接串
+    """
+    global _engine
+    if _engine is None:
+        if not config.SQLITE_DB_URL:
+            raise ValueError("未配置 SQLITE_DB_URL，请在 .env 中设置。")
+        _engine = create_engine(config.SQLITE_DB_URL, echo=False, future=True)
+    return _engine
+
+
+def get_chroma_vector_store() -> Chroma:
+    """
+    获取 Chroma 向量库（单例）。
+
+    说明：
+    - 依赖 knowledge_base/build_rag.py 预先构建的持久化向量库
+    - 若目录不存在，将抛出异常提示用户先执行构建脚本
+    """
+    global _chroma
+    if _chroma is None:
+        # 使用与 build_rag.py 相同的 HuggingFace Embeddings，避免调用外部 Embeddings API（DeepSeek 无兼容接口或会 404）
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        )
+        _chroma = Chroma(
+            embedding_function=embeddings,
+            persist_directory=config.CHROMA_PERSIST_DIR,
+        )
+    return _chroma
+
+
+def _safe_identifier(name: str) -> str:
+    """
+    对表名 / 字段名做简单的白名单校验，避免 SQL 注入。
+
+    规则：
+    - 只能包含字母、数字和下划线
+    - 必须以字母或下划线开头
+    """
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+        raise ValueError(f"非法标识符：{name}")
+    return name
+
+
+# --- 工具 1：主键唯一性与非空检查 ----------------------------------------------
+
+
+@tool
+def check_pk_tool(table_name: str, pk_column: str) -> str:
+    """
+    校验指定表的逻辑主键是否唯一且非空。
+
+    参数：
+    - table_name: 表名，例如 "dwd_trade_order_di"
+    - pk_column: 逻辑主键字段名，例如 "order_id"
+
+    返回：
+    - 一段 Markdown 文本，包含：
+      - 总记录数
+      - 主键非空记录数
+      - 主键去重后的记录数
+      - 重复主键条数
+      - 主键为空的条数
+    """
+    table = _safe_identifier(table_name)
+    pk = _safe_identifier(pk_column)
+
+    engine = get_sqlite_engine()
+
+    sql = text(
+        f"""
+        SELECT
+            COUNT(1) AS total_count,
+            COUNT({pk}) AS non_null_count,
+            COUNT(DISTINCT {pk}) AS distinct_non_null_count
+        FROM {table}
+        """
+    )
+
+    with engine.connect() as conn:
+        row = conn.execute(sql).one()
+
+    total_count = int(row.total_count)
+    non_null_count = int(row.non_null_count)
+    distinct_non_null_count = int(row.distinct_non_null_count)
+    null_pk_count = total_count - non_null_count
+    duplicate_pk_count = non_null_count - distinct_non_null_count
+
+    status_lines: List[str] = []
+    if null_pk_count == 0 and duplicate_pk_count == 0:
+        status_lines.append("**结论：主键字段在当前表中唯一且非空。** ✅")
+    else:
+        status_lines.append("**结论：检测到主键字段存在异常，请重点关注。** ⚠️")
+
+    detail = f"""
+### 主键完整性检查结果（表：`{table}`，主键字段：`{pk}`）
+
+- 总记录数：`{total_count}`
+- 主键非空记录数：`{non_null_count}`
+- 主键去重后的记录数：`{distinct_non_null_count}`
+- 主键为空记录数：`{null_pk_count}`
+- 主键重复记录数（非空且重复）：`{duplicate_pk_count}`
+
+{chr(10).join(status_lines)}
+"""
+    return detail.strip()
+
+
+# --- 工具 2：两日数据量波动检查 -------------------------------------------------
+
+
+@tool
+def check_volume_tool(table_name: str, dt_t: str, dt_t_minus_1: str) -> str:
+    """
+    对比同一张表在 t 日与 t-1 日的记录数，用于快速发现数据量异常波动。
+
+    参数：
+    - table_name: 表名，例如 "dwd_trade_order_di"
+    - dt_t: t 日的分区值（字符串形式的日期，如 "2026-03-08"）
+    - dt_t_minus_1: t-1 日的分区值
+
+    返回：
+    - 一段 Markdown 文本，包含两天的记录数和波动结论。
+    - 如果 t 日数据量小于 t-1 日，将在文本中包含 "[WARNING]"。
+    """
+    table = _safe_identifier(table_name)
+
+    engine = get_sqlite_engine()
+
+    with engine.connect() as conn:
+        sql_t = text(f"SELECT COUNT(1) AS cnt FROM {table} WHERE dt = :dt")
+        sql_t_minus_1 = text(f"SELECT COUNT(1) AS cnt FROM {table} WHERE dt = :dt")
+
+        cnt_t = int(conn.execute(sql_t, {"dt": dt_t}).scalar() or 0)
+        cnt_t_minus_1 = int(conn.execute(sql_t_minus_1, {"dt": dt_t_minus_1}).scalar() or 0)
+
+    diff = cnt_t - cnt_t_minus_1
+    ratio = (cnt_t / cnt_t_minus_1) if cnt_t_minus_1 > 0 else None
+
+    warning_flag = cnt_t < cnt_t_minus_1
+    flag_text = "[WARNING]" if warning_flag else "[OK]"
+
+    ratio_str = f"{ratio:.2%}" if ratio is not None else "N/A"
+
+    detail = f"""
+### 数据量波动检查结果（表：`{table}`）
+
+- t-1 日（`{dt_t_minus_1}`）记录数：`{cnt_t_minus_1}`
+- t 日（`{dt_t}`）记录数：`{cnt_t}`
+- 绝对变化量：`{diff}`
+- 相对变化比例（t / t-1）：`{ratio_str}`
+
+**结论：{flag_text}**
+
+- 若为 [WARNING]，说明 t 日数据量低于 t-1 日，请排查上游任务是否延迟或失败。
+- 若为 [OK]，说明两日数据量整体稳定或在可接受波动范围内。
+"""
+    return detail.strip()
+
+
+# --- 工具 2.5：列出所有表名（供 Agentic RAG 先发现表再查元数据） -------------
+
+
+@tool
+def list_tables_tool() -> str:
+    """
+    列出当前 SQLite 数据库中所有用户表的表名。
+
+    返回：
+    - 一段 Markdown 文本，包含表名列表；若无表则提示为空。
+    """
+    engine = get_sqlite_engine()
+    sql = text("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    with engine.connect() as conn:
+        rows = conn.execute(sql).fetchall()
+    names = [row.name for row in rows if row.name]
+    if not names:
+        return "当前数据库中没有任何用户表。"
+    return "### 当前数据库中的表\n\n" + "\n".join(f"- `{n}`" for n in names)
+
+
+# --- 工具 3：表结构元数据查询 ---------------------------------------------------
+
+
+@tool
+def query_table_metadata_tool(table_name: str) -> str:
+    """
+    查询 SQLite 表结构信息（字段名、数据类型、是否允许为空、是否为主键）。
+
+    参数：
+    - table_name: 表名，例如 "dwd_trade_order_di"
+
+    返回：
+    - 一段 Markdown 文本，包含字段级元数据信息。
+
+    说明：
+    - 在 MySQL 中常用 information_schema.COLUMNS，这里使用 SQLite 的 PRAGMA table_info 实现等价功能。
+    """
+    table = _safe_identifier(table_name)
+    engine = get_sqlite_engine()
+
+    # PRAGMA table_info 返回字段：cid, name, type, notnull, dflt_value, pk
+    pragma_sql = text(f"PRAGMA table_info('{table}')")
+
+    with engine.connect() as conn:
+        rows = conn.execute(pragma_sql).fetchall()
+
+    if not rows:
+        return f"未在当前 SQLite 数据库中找到表 `{table}`，请确认表名是否正确。"
+
+    header = "| 字段名 | 数据类型 | 是否非空 | 是否主键 |\n|--------|----------|----------|----------|"
+    lines = [header]
+    for row in rows:
+        name = row.name
+        col_type = row.type or ""
+        notnull = "YES" if row.notnull else "NO"
+        is_pk = "YES" if row.pk else "NO"
+        lines.append(f"| `{name}` | `{col_type}` | {notnull} | {is_pk} |")
+
+    md = f"""
+### 表结构信息：`{table}`
+
+> 数据源：SQLite PRAGMA table_info('{table}')
+
+{chr(10).join(lines)}
+"""
+    return md.strip()
+
+
+# --- 工具 4：RAG 检索业务口径定义 ----------------------------------------------
+
+
+@tool
+def rag_definition_tool(query: str, top_k: int = 3) -> str:
+    """
+    基于 ChromaDB 的业务口径知识库，对用户查询进行相似度检索。
+
+    参数：
+    - query: 用户自然语言问题，例如“GMV 是如何定义的？”
+    - top_k: 返回的相似文档数量（默认 3）
+
+    返回：
+    - 一段 Markdown 文本，其中包含与 query 最相关的若干业务口径定义片段。
+    """
+    vector_store = get_chroma_vector_store()
+    docs = vector_store.similarity_search(query, k=top_k)
+
+    if not docs:
+        return "在业务口径知识库中未找到相关定义，请尝试换个描述方式。"
+
+    parts = ["### 业务口径知识库检索结果"]
+    for idx, doc in enumerate(docs, start=1):
+        source = doc.metadata.get("source", "unknown")
+        parts.append(f"\n#### 命中片段 {idx}（来源：`{source}`）\n")
+        parts.append(doc.page_content.strip())
+
+    return "\n".join(parts).strip()
+
+
+__all__ = [
+    "check_pk_tool",
+    "check_volume_tool",
+    "list_tables_tool",
+    "query_table_metadata_tool",
+    "rag_definition_tool",
+    "get_sqlite_engine",
+]
+
