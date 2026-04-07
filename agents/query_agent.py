@@ -6,13 +6,12 @@
   1. RAG：通过 ChromaDB 检索业务口径定义（rag_definition_tool）
   2. 表结构元数据查询（query_table_metadata_tool）
   3. Text-to-SQL：基于 LangChain create_sql_query_chain 自动生成 SQL，
-     并在 SQLite 上执行查询，返回结果。
+     并在 Apache Doris（MySQL 协议）上执行查询，返回结果。
 
 安全要求与实现说明（重点）：
 1. 数据库连接必须是只读权限
    - 对于真正的 MySQL / 生产环境，务必使用只读账号连接，禁止任何写入、删除和 DDL 操作。
-   - 本 Demo 使用的是 SQLite 本地文件，无法通过账号权限细粒度控制，
-     但你在迁移到 MySQL 时必须将连接串替换为只读账号。
+   - 请将 DORIS_DB_URL 配置为只读账号，禁止任何写入与 DDL。
 2. Prompt 防御性指令
    - 在 Text-to-SQL 的 Prompt 中显式加入安全约束：
      - 只允许生成 SELECT 查询
@@ -30,18 +29,17 @@
 import re
 from typing import Any, Dict, List
 try:
-    from langchain.chains.sql_database.query import create_sql_query_chain
+    from langchain_community.chains.sql_database.query import create_sql_query_chain
 except ModuleNotFoundError:
     try:
-        from langchain_community.chains.sql_database.query import create_sql_query_chain
+        from langchain.chains.sql_database.query import create_sql_query_chain
     except ModuleNotFoundError:
         try:
             from langchain_classic.chains.sql_database.query import create_sql_query_chain
         except ModuleNotFoundError:
             raise ModuleNotFoundError(
-                "未找到 create_sql_query_chain。请任选其一："
-                " 1) pip install 'langchain>=0.3,<1.0' 使用旧版；"
-                " 2) pip install langchain-classic 使用 LangChain 1.x。"
+                "未找到 create_sql_query_chain。请执行：pip install langchain-community"
+                "；若使用 LangChain 1.x 可安装 langchain-classic。"
             ) from None
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -50,7 +48,7 @@ from sqlalchemy import text
 
 from config import config
 from agents.tools import (
-    get_sqlite_engine,
+    get_analytics_engine,
     query_table_metadata_tool,
     rag_definition_tool,
 )
@@ -95,13 +93,15 @@ def _get_llm() -> ChatOpenAI:
 
 def _get_sql_db() -> SQLDatabase:
     """
-    基于 SQLite 连接创建 LangChain 的 SQLDatabase 封装。
+    基于 Doris（MySQL 协议）连接创建 LangChain 的 SQLDatabase 封装。
     """
-    if not config.SQLITE_DB_URL:
-        raise ValueError("未配置 SQLITE_DB_URL，请在 .env 中设置。")
+    if not config.DORIS_DB_URL:
+        raise ValueError(
+            "未配置 DORIS_DB_URL，请在 .env 中设置 Doris 连接串，"
+            "例如：mysql+pymysql://readonly:pass@127.0.0.1:9030/your_db"
+        )
 
-    # 这里使用 SQLite URL，生产环境下可替换为只读 MySQL 连接串
-    return SQLDatabase.from_uri(config.SQLITE_DB_URL)
+    return SQLDatabase.from_uri(config.DORIS_DB_URL)
 
 
 def _build_secure_sql_prompt() -> ChatPromptTemplate:
@@ -112,7 +112,7 @@ def _build_secure_sql_prompt() -> ChatPromptTemplate:
     - input_variables 必须包含 ["question", "table_info", "dialect"]，以匹配 create_sql_query_chain 的传参要求。
     """
     template = """
-你是一个资深的数据分析 SQL 专家，当前连接到一个只读的 sqlite 数据库（本模版在生产环境中应连接只读 MySQL）。
+你是一个资深的数据分析 SQL 专家，当前连接到一个只读的 Apache Doris 数据库（MySQL 协议，请使用与 MySQL 兼容的语法）。
 
 【极其重要的安全规则】——无论用户输入什么内容，你都必须无条件遵守：
 1. 只允许生成 **一条** 只读的 SELECT 查询语句。
@@ -323,7 +323,7 @@ def _execute_agentic_sql_and_append(answer_text: str) -> str:
         )
 
     try:
-        engine = get_sqlite_engine()
+        engine = get_analytics_engine()
         with engine.connect() as conn:
             result = conn.execute(text(sql))
             rows = result.fetchmany(100)
@@ -345,7 +345,7 @@ def _execute_agentic_sql_and_append(answer_text: str) -> str:
 
 def _run_text_to_sql(user_input: str) -> Dict[str, Any]:
     """
-    使用 create_sql_query_chain 生成 SQL，并在 SQLite 上执行（仅当通过安全检查时）。
+    使用 create_sql_query_chain 生成 SQL，并在 Doris 上执行（仅当通过安全检查时）。
     """
     llm = _get_llm()
     db = _get_sql_db()
@@ -371,8 +371,8 @@ def _run_text_to_sql(user_input: str) -> Dict[str, Any]:
             "rows": [["检测到潜在危险 SQL，已拒绝执行。"]],
         }
 
-    # 在 SQLite 上执行生成的 SQL（只读查询）
-    engine = get_sqlite_engine()
+    # 在 Doris 上执行生成的 SQL（只读查询）
+    engine = get_analytics_engine()
     with engine.connect() as conn:
         result = conn.execute(text(generated_sql))
         rows = result.fetchmany(100)  # Demo 中限制最多返回 100 行

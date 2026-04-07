@@ -1,16 +1,23 @@
 """
-多层级电商数仓模拟数据初始化脚本（SQLite）。
+多层级电商数仓模拟数据初始化脚本（目标：Apache Doris）。
 
 生成 ODS / DWD / DWS / ADS 四层表结构与至少连续 3 天的数据，
 模拟大促前后数据波动，供 Agentic RAG 查数找数使用。
 
+依赖：
+- .env 中配置 DORIS_DB_URL（需具备建表与写入权限；应用只读账号可另配）。
+
 表说明：
-- ODS: ods_log_user_action_di  用户行为日志（按天分区）
+- ODS: ods_log_user_action_di  用户行为日志（按天分区字段 dt）
 - DWD: dwd_trade_order_detail_di 订单明细（order_id, user_id, sku_id, pay_amount, dt）
 - DWS: dws_user_trade_summary_nd 用户粒度交易汇总（user_id, is_new_user, total_amount, order_count, dt）
 - ADS: ads_sales_dashboard_di  大盘销售看板
+
+环境变量：
+- INIT_WAREHOUSE_TRUNCATE=true  导入前清空上述四张表（便于重复执行）
 """
 
+import os
 import random
 from datetime import date, timedelta
 from typing import List
@@ -19,79 +26,16 @@ import pandas as pd
 from faker import Faker
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from sqlalchemy import create_engine
 
-from config import config
+from .doris_ddls import create_warehouse_tables_doris, truncate_warehouse_tables_doris
+from .doris_engine import get_doris_engine
 
 fake = Faker("zh_CN")
 
 
 def get_engine() -> Engine:
-    if not config.SQLITE_DB_URL:
-        raise ValueError("未配置 SQLITE_DB_URL")
-    return create_engine(config.SQLITE_DB_URL, echo=False, future=True)
-
-
-def run_ddl(engine: Engine, statements: List[str]) -> None:
-    with engine.begin() as conn:
-        for stmt in statements:
-            conn.execute(text(stmt))
-
-
-def create_ods_table(engine: Engine) -> None:
-    """ODS 层：用户行为日志，按天分区（dt）。"""
-    run_ddl(engine, ["""
-    CREATE TABLE IF NOT EXISTS ods_log_user_action_di (
-        log_id TEXT,
-        user_id INTEGER NOT NULL,
-        action_type TEXT NOT NULL,
-        page TEXT,
-        extra_json TEXT,
-        dt TEXT NOT NULL
-    );
-    """])
-
-
-def create_dwd_table(engine: Engine) -> None:
-    """DWD 层：订单明细。"""
-    run_ddl(engine, ["""
-    CREATE TABLE IF NOT EXISTS dwd_trade_order_detail_di (
-        order_id TEXT NOT NULL,
-        user_id INTEGER NOT NULL,
-        sku_id TEXT NOT NULL,
-        pay_amount REAL NOT NULL,
-        quantity INTEGER NOT NULL,
-        dt TEXT NOT NULL
-    );
-    """])
-
-
-def create_dws_table(engine: Engine) -> None:
-    """DWS 层：用户粒度交易汇总（含新老客标签）。"""
-    run_ddl(engine, ["""
-    CREATE TABLE IF NOT EXISTS dws_user_trade_summary_nd (
-        user_id INTEGER NOT NULL,
-        is_new_user INTEGER NOT NULL,
-        total_amount REAL NOT NULL,
-        order_count INTEGER NOT NULL,
-        dt TEXT NOT NULL
-    );
-    """])
-
-
-def create_ads_table(engine: Engine) -> None:
-    """ADS 层：大盘销售看板。"""
-    run_ddl(engine, ["""
-    CREATE TABLE IF NOT EXISTS ads_sales_dashboard_di (
-        dt TEXT NOT NULL,
-        gmv REAL NOT NULL,
-        order_count INTEGER NOT NULL,
-        new_user_count INTEGER NOT NULL,
-        old_user_count INTEGER NOT NULL,
-        atv_new REAL,
-        atv_old REAL
-    );
-    """])
+    """写入 Doris 的 Engine（与 config.DORIS_DB_URL 一致）。"""
+    return get_doris_engine()
 
 
 def generate_ods_for_date(d: date, n: int) -> pd.DataFrame:
@@ -155,9 +99,9 @@ def generate_ads_for_date(engine: Engine, d: date) -> None:
     SELECT
         :dt AS dt,
         SUM(total_amount) AS gmv,
-        SUM(order_count) AS order_count,
-        SUM(CASE WHEN is_new_user = 1 THEN 1 ELSE 0 END) AS new_user_count,
-        SUM(CASE WHEN is_new_user = 0 THEN 1 ELSE 0 END) AS old_user_count,
+        CAST(SUM(order_count) AS BIGINT) AS order_count,
+        CAST(SUM(CASE WHEN is_new_user = 1 THEN 1 ELSE 0 END) AS BIGINT) AS new_user_count,
+        CAST(SUM(CASE WHEN is_new_user = 0 THEN 1 ELSE 0 END) AS BIGINT) AS old_user_count,
         CASE WHEN SUM(CASE WHEN is_new_user = 1 THEN 1 ELSE 0 END) > 0
              THEN SUM(CASE WHEN is_new_user = 1 THEN total_amount ELSE 0 END) * 1.0 / SUM(CASE WHEN is_new_user = 1 THEN 1 ELSE 0 END) ELSE NULL END AS atv_new,
         CASE WHEN SUM(CASE WHEN is_new_user = 0 THEN 1 ELSE 0 END) > 0
@@ -169,17 +113,17 @@ def generate_ads_for_date(engine: Engine, d: date) -> None:
         conn.execute(text(sql), {"dt": d.isoformat()})
 
 
-def main():
+def main() -> None:
     engine = get_engine()
-    create_ods_table(engine)
-    create_dwd_table(engine)
-    create_dws_table(engine)
-    create_ads_table(engine)
+    create_warehouse_tables_doris(engine)
+
+    if os.getenv("INIT_WAREHOUSE_TRUNCATE", "").lower() in ("1", "true", "yes"):
+        truncate_warehouse_tables_doris(engine)
+        print("已按 INIT_WAREHOUSE_TRUNCATE 清空 ODS/DWD/DWS/ADS 四张表。")
 
     # 连续 3 天：T-2 基准，T-1 略涨，T 大促日明显放大
     base = date.today() - timedelta(days=2)
     days = [base + timedelta(days=i) for i in range(3)]
-    # 大促日倍数
     boosts = [1.0, 1.1, 1.5]
 
     for d, boost in zip(days, boosts):
@@ -192,7 +136,7 @@ def main():
         generate_dws_from_dwd(engine, d)
         generate_ads_for_date(engine, d)
 
-    print("数仓初始化完成。")
+    print("数仓初始化完成（Apache Doris）。")
     print("表：ods_log_user_action_di, dwd_trade_order_detail_di, dws_user_trade_summary_nd, ads_sales_dashboard_di")
     print("日期：", [d.isoformat() for d in days])
 

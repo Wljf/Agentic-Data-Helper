@@ -24,11 +24,12 @@ class Config:
     FLASK_ENV: str = os.getenv("FLASK_ENV", "development")
     FLASK_DEBUG: bool = os.getenv("FLASK_DEBUG", "True").lower() == "true"
 
-    # SQLite 数据库 URL
-    # 说明：
-    # - 默认使用当前项目目录下的 data_agent.db 文件
-    # - 你可以在 .env 中通过 SQLITE_DB_URL 自定义路径
+    # SQLite 数据库 URL（历史字段，数仓与验证 Demo 已迁移至 Doris；保留以兼容旧配置）
     SQLITE_DB_URL: str = os.getenv("SQLITE_DB_URL", "sqlite:///./data_agent.db")
+
+    # Apache Doris（MySQL 协议），Agent 查数、校验工具与 Text-to-SQL 的执行目标
+    # 示例：mysql+pymysql://readonly:pass@127.0.0.1:9030/your_db
+    DORIS_DB_URL: str = os.getenv("DORIS_DB_URL", "")
 
     # LLM（支持 OpenAI 及 OpenAI 兼容接口，如 DeepSeek）
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")

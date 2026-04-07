@@ -27,7 +27,7 @@
 
 - 语言：`Python`
 - Web：`Flask`
-- 数据库：`SQLite`、`SQLAlchemy`
+- 数据库：`Apache Doris`（MySQL 协议）、`SQLAlchemy`
 - 数据处理：`Pandas`、`Faker`
 - LLM / Agent：`LangChain`、`LangGraph`、`OpenAI Compatible API / DeepSeek`
 - 向量检索：`ChromaDB`
@@ -112,8 +112,12 @@ data_agent_project/
 │  ├─ tools.py
 │  └─ validation_agent.py
 ├─ data_mock/
+│  ├─ doris_ddls.py
+│  ├─ doris_engine.py
 │  ├─ generate_data.py
 │  └─ init_warehouse.py
+├─ docs/
+│  └─ doris-setup.md
 ├─ knowledge_base/
 │  ├─ build_rag.py
 │  ├─ definitions.md
@@ -142,7 +146,9 @@ pip install -r requirements.txt
 OPENAI_API_KEY=your_api_key
 OPENAI_API_BASE=https://api.deepseek.com/v1
 OPENAI_MODEL=deepseek-chat
-SQLITE_DB_URL=sqlite:///./data_agent.db
+# Apache Doris（MySQL 协议，连接 FE 默认端口 9030）
+# 初始化脚本需要建表/写入权限；生产环境 Agent 建议使用只读账号，见 docs/doris-setup.md
+DORIS_DB_URL=mysql+pymysql://user:password@127.0.0.1:9030/data_agent
 CHROMA_PERSIST_DIR=./chroma_db
 FLASK_DEBUG=True
 ```
@@ -150,20 +156,36 @@ FLASK_DEBUG=True
 说明：
 
 - `OPENAI_API_BASE` 支持 OpenAI 兼容接口，这里默认可接 DeepSeek
-- `SQLITE_DB_URL` 默认使用本地 `data_agent.db`
+- `DORIS_DB_URL` 为 Web 应用、Agent 查询与 **数仓初始化脚本** 的默认目标库；部署与权限详见 [docs/doris-setup.md](docs/doris-setup.md)
 
 ### 3. 初始化数仓数据
+
+**请先完成 Doris 部署与库表权限配置**（见 [docs/doris-setup.md](docs/doris-setup.md)），然后在项目根目录执行：
 
 ```bash
 python -m data_mock.init_warehouse
 ```
 
-该脚本会创建并写入以下表：
+可选：重复执行前清空四张业务表再导入：
+
+```bash
+INIT_WAREHOUSE_TRUNCATE=true python -m data_mock.init_warehouse
+```
+
+该脚本会在 **Doris** 中创建并写入以下表：
 
 - `ods_log_user_action_di`
 - `dwd_trade_order_detail_di`
 - `dws_user_trade_summary_nd`
 - `ads_sales_dashboard_di`
+
+数据验证场景（主键/数据量波动 Demo）需额外导入：
+
+```bash
+python -m data_mock.generate_data
+```
+
+可选：`INIT_VALIDATION_TRUNCATE=true python -m data_mock.generate_data` 仅清空 `dwd_trade_order_di` 后重导。
 
 ### 4. 构建知识库
 
@@ -190,23 +212,16 @@ python app.py
 
 ## 如何重新生成数据
 
-如果你想完全重建本地环境，建议按以下顺序：
+如果你想在 **Doris** 中重建数仓与验证样例数据，建议按以下顺序：
 
-### 1. 删除旧数据库（可选）
-
-Windows PowerShell：
-
-```powershell
-del data_agent.db
-```
-
-### 2. 重新初始化数仓
+### 1. 清空并重新导入数仓（可选）
 
 ```bash
-python -m data_mock.init_warehouse
+INIT_WAREHOUSE_TRUNCATE=true python -m data_mock.init_warehouse
+INIT_VALIDATION_TRUNCATE=true python -m data_mock.generate_data
 ```
 
-### 3. 重建向量知识库
+### 2. 重建向量知识库（可选）
 
 ```bash
 python -m knowledge_base.build_rag

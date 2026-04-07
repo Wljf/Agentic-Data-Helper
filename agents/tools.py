@@ -7,7 +7,7 @@ Agent 工具函数集合（基于 LangChain @tool）。
 2. check_volume_tool
    - 对比 t 日与 t-1 日两天的数据量，判断是否出现异常波动
 3. query_table_metadata_tool
-   - 查询 SQLite 表结构信息（字段名、数据类型等）
+   - 查询 Doris 表结构信息（字段名、数据类型等，基于 information_schema）
 4. rag_definition_tool
    - 基于 ChromaDB 的业务口径知识库检索（RAG）
 """
@@ -30,20 +30,34 @@ _engine: Engine | None = None
 _chroma: Chroma | None = None
 
 
-def get_sqlite_engine() -> Engine:
+def get_analytics_engine() -> Engine:
     """
-    获取 SQLite Engine（单例）。
+    获取分析库 Engine（单例，Apache Doris，MySQL 协议）。
 
     说明：
-    - 使用 config.SQLITE_DB_URL 作为连接 URL
-    - 由于 SQLite 是本地文件数据库，本 Demo 直接使用同一个连接串
+    - 使用 config.DORIS_DB_URL（SQLAlchemy URL，例如 mysql+pymysql://...）
+    - 生产环境请使用只读账号
     """
     global _engine
     if _engine is None:
-        if not config.SQLITE_DB_URL:
-            raise ValueError("未配置 SQLITE_DB_URL，请在 .env 中设置。")
-        _engine = create_engine(config.SQLITE_DB_URL, echo=False, future=True)
+        if not config.DORIS_DB_URL:
+            raise ValueError(
+                "未配置 DORIS_DB_URL，请在 .env 中设置 Doris 连接串，"
+                "例如：mysql+pymysql://user:pass@127.0.0.1:9030/your_db"
+            )
+        _engine = create_engine(
+            config.DORIS_DB_URL,
+            echo=False,
+            future=True,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
     return _engine
+
+
+def get_sqlite_engine() -> Engine:
+    """兼容旧名称：与 get_analytics_engine() 相同（当前分析库为 Doris）。"""
+    return get_analytics_engine()
 
 
 def get_chroma_vector_store() -> Chroma:
@@ -103,7 +117,7 @@ def check_pk_tool(table_name: str, pk_column: str) -> str:
     table = _safe_identifier(table_name)
     pk = _safe_identifier(pk_column)
 
-    engine = get_sqlite_engine()
+    engine = get_analytics_engine()
 
     sql = text(
         f"""
@@ -163,7 +177,7 @@ def check_volume_tool(table_name: str, dt_t: str, dt_t_minus_1: str) -> str:
     """
     table = _safe_identifier(table_name)
 
-    engine = get_sqlite_engine()
+    engine = get_analytics_engine()
 
     with engine.connect() as conn:
         sql_t = text(f"SELECT COUNT(1) AS cnt FROM {table} WHERE dt = :dt")
@@ -202,13 +216,21 @@ def check_volume_tool(table_name: str, dt_t: str, dt_t_minus_1: str) -> str:
 @tool
 def list_tables_tool() -> str:
     """
-    列出当前 SQLite 数据库中所有用户表的表名。
+    列出当前 Doris 数据库（当前连接默认库）中所有 BASE TABLE 的表名。
 
     返回：
     - 一段 Markdown 文本，包含表名列表；若无表则提示为空。
     """
-    engine = get_sqlite_engine()
-    sql = text("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    engine = get_analytics_engine()
+    sql = text(
+        """
+        SELECT TABLE_NAME AS name
+        FROM information_schema.tables
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_TYPE = 'BASE TABLE'
+        ORDER BY TABLE_NAME
+        """
+    )
     with engine.connect() as conn:
         rows = conn.execute(sql).fetchall()
     names = [row.name for row in rows if row.name]
@@ -223,7 +245,7 @@ def list_tables_tool() -> str:
 @tool
 def query_table_metadata_tool(table_name: str) -> str:
     """
-    查询 SQLite 表结构信息（字段名、数据类型、是否允许为空、是否为主键）。
+    查询 Doris 表结构信息（字段名、数据类型、是否允许为空、是否为主键列）。
 
     参数：
     - table_name: 表名，例如 "dwd_trade_order_di"
@@ -232,33 +254,47 @@ def query_table_metadata_tool(table_name: str) -> str:
     - 一段 Markdown 文本，包含字段级元数据信息。
 
     说明：
-    - 在 MySQL 中常用 information_schema.COLUMNS，这里使用 SQLite 的 PRAGMA table_info 实现等价功能。
+    - 使用 information_schema.COLUMNS（与 MySQL 兼容）。
     """
     table = _safe_identifier(table_name)
-    engine = get_sqlite_engine()
+    engine = get_analytics_engine()
 
-    # PRAGMA table_info 返回字段：cid, name, type, notnull, dflt_value, pk
-    pragma_sql = text(f"PRAGMA table_info('{table}')")
+    meta_sql = text(
+        """
+        SELECT
+            COLUMN_NAME AS col_name,
+            DATA_TYPE AS data_type,
+            IS_NULLABLE AS is_nullable,
+            COLUMN_KEY AS column_key
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = :table_name
+        ORDER BY ORDINAL_POSITION
+        """
+    )
 
     with engine.connect() as conn:
-        rows = conn.execute(pragma_sql).fetchall()
+        rows = conn.execute(meta_sql, {"table_name": table}).fetchall()
 
     if not rows:
-        return f"未在当前 SQLite 数据库中找到表 `{table}`，请确认表名是否正确。"
+        return f"未在当前 Doris 数据库中找到表 `{table}`，请确认表名是否正确。"
 
     header = "| 字段名 | 数据类型 | 是否非空 | 是否主键 |\n|--------|----------|----------|----------|"
     lines = [header]
     for row in rows:
-        name = row.name
-        col_type = row.type or ""
-        notnull = "YES" if row.notnull else "NO"
-        is_pk = "YES" if row.pk else "NO"
+        m = row._mapping
+        name = m["col_name"]
+        col_type = (m.get("data_type") or "") or ""
+        is_nullable = (m.get("is_nullable") or "").upper()
+        notnull = "YES" if is_nullable == "NO" else "NO"
+        col_key = (m.get("column_key") or "").upper()
+        is_pk = "YES" if col_key == "PRI" else "NO"
         lines.append(f"| `{name}` | `{col_type}` | {notnull} | {is_pk} |")
 
     md = f"""
 ### 表结构信息：`{table}`
 
-> 数据源：SQLite PRAGMA table_info('{table}')
+> 数据源：information_schema.COLUMNS（TABLE_SCHEMA = DATABASE()）
 
 {chr(10).join(lines)}
 """
@@ -301,6 +337,7 @@ __all__ = [
     "list_tables_tool",
     "query_table_metadata_tool",
     "rag_definition_tool",
+    "get_analytics_engine",
     "get_sqlite_engine",
 ]
 

@@ -245,7 +245,7 @@ def node_refine(state: AgentState) -> Dict[str, Any]:
 
 def node_retrieve(state: AgentState) -> Dict[str, Any]:
     """
-    根据重写后的子问题（或上一轮 reflect 提供的 subquery）查询 ChromaDB 口径或 SQLite 表结构，
+    根据重写后的子问题（或上一轮 reflect 提供的 subquery）查询 ChromaDB 口径或 Doris 表结构，
     将结果追加到 current_collected_contexts 中，并递增 current_retrieval_round。
 
     流转：node_refine -> node_retrieve -> node_reflect
@@ -464,7 +464,7 @@ def node_aggregate(state: AgentState) -> Dict[str, Any]:
         [
             (
                 "system",
-                "你是一个 BI 分析助手，当前数据库为只读 SQLite（生产可为只读 MySQL）。\n"
+                "你是一个 BI 分析助手，当前数据库为只读 Apache Doris（MySQL 协议）。\n"
                 "请根据「用户原始问题」和「已集齐的子问答结论（业务口径 + 表结构信息）」完成两件事：\n"
                 "1）生成一条**只读 SELECT** 查询 SQL，直接满足用户的查数需求；\n"
                 "2）用通俗语言解释统计口径（如新老客、客单价、GMV 等）。\n"
