@@ -9,25 +9,23 @@ Agent 工具函数集合（基于 LangChain @tool）。
 3. query_table_metadata_tool
    - 查询 Doris 表结构信息（字段名、数据类型等，基于 information_schema）
 4. rag_definition_tool
-   - 基于 ChromaDB 的业务口径知识库检索（RAG）
+   - 业务口径混合检索：向量 + BM25（RRF 融合）+ 精排（双塔余弦或 CrossEncoder）
 """
 
 import re
 from typing import List
 
 from langchain_core.tools import tool
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from config import config
+from knowledge_base.hybrid_retrieval import get_chroma, hybrid_search
 
 
 # --- 数据库与向量库基础设施 ----------------------------------------------------
 
 _engine: Engine | None = None
-_chroma: Chroma | None = None
 
 
 def get_analytics_engine() -> Engine:
@@ -60,25 +58,14 @@ def get_sqlite_engine() -> Engine:
     return get_analytics_engine()
 
 
-def get_chroma_vector_store() -> Chroma:
+def get_chroma_vector_store():
     """
-    获取 Chroma 向量库（单例）。
+    获取 Chroma 向量库（单例，与 hybrid_retrieval 共用）。
 
     说明：
-    - 依赖 knowledge_base/build_rag.py 预先构建的持久化向量库
-    - 若目录不存在，将抛出异常提示用户先执行构建脚本
+    - 依赖 knowledge_base/build_rag.py 预先构建持久化向量库与 kb_manifest.json
     """
-    global _chroma
-    if _chroma is None:
-        # 使用与 build_rag.py 相同的 HuggingFace Embeddings，避免调用外部 Embeddings API（DeepSeek 无兼容接口或会 404）
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-        )
-        _chroma = Chroma(
-            embedding_function=embeddings,
-            persist_directory=config.CHROMA_PERSIST_DIR,
-        )
-    return _chroma
+    return get_chroma()
 
 
 def _safe_identifier(name: str) -> str:
@@ -305,28 +292,32 @@ def query_table_metadata_tool(table_name: str) -> str:
 
 
 @tool
-def rag_definition_tool(query: str, top_k: int = 3) -> str:
+def rag_definition_tool(query: str, top_k: int = 5) -> str:
     """
-    基于 ChromaDB 的业务口径知识库，对用户查询进行相似度检索。
+    基于混合检索（向量 + BM25 召回，RRF 融合，精排）从业务口径知识库取回相关片段。
 
     参数：
     - query: 用户自然语言问题，例如“GMV 是如何定义的？”
-    - top_k: 返回的相似文档数量（默认 3）
+    - top_k: 最终返回的片段数量（默认 5）
 
     返回：
     - 一段 Markdown 文本，其中包含与 query 最相关的若干业务口径定义片段。
     """
-    vector_store = get_chroma_vector_store()
-    docs = vector_store.similarity_search(query, k=top_k)
+    try:
+        hits = hybrid_search(query, final_k=top_k)
+    except Exception as e:
+        return f"业务口径检索失败：{e}"
 
-    if not docs:
+    if not hits:
         return "在业务口径知识库中未找到相关定义，请尝试换个描述方式。"
 
-    parts = ["### 业务口径知识库检索结果"]
-    for idx, doc in enumerate(docs, start=1):
-        source = doc.metadata.get("source", "unknown")
-        parts.append(f"\n#### 命中片段 {idx}（来源：`{source}`）\n")
-        parts.append(doc.page_content.strip())
+    parts = ["### 业务口径知识库检索结果（向量 + BM25 混合，精排）"]
+    for idx, h in enumerate(hits, start=1):
+        meta = h.get("metadata") or {}
+        source = meta.get("source", "unknown")
+        cid = h.get("chunk_id", "")
+        parts.append(f"\n#### 命中片段 {idx}（`{source}` · `{cid}`）\n")
+        parts.append((h.get("text") or "").strip())
 
     return "\n".join(parts).strip()
 

@@ -117,8 +117,17 @@ data_agent_project/
 │  ├─ generate_data.py
 │  └─ init_warehouse.py
 ├─ docs/
-│  └─ doris-setup.md
+│  ├─ doris-setup.md
+│  ├─ golden-benchmark.md
+│  └─ rag-retrieval.md
+├─ evaluation/
+│  ├─ golden_sql.json
+│  ├─ rag_golden.json
+│  ├─ run_benchmark.py
+│  ├─ run_rag_benchmark.py
+│  └─ run_all_metrics.py
 ├─ knowledge_base/
+│  ├─ hybrid_retrieval.py
 │  ├─ build_rag.py
 │  ├─ definitions.md
 │  └─ business_definitions.md
@@ -193,10 +202,12 @@ python -m data_mock.generate_data
 python -m knowledge_base.build_rag
 ```
 
-该脚本会将以下业务文档向量化并写入本地 `ChromaDB`：
+该脚本会对 Markdown **分块**后写入 `ChromaDB`，并生成同目录下的 **`kb_manifest.json`**（供 BM25 与混合检索）。业务文档：
 
 - `knowledge_base/definitions.md`
 - `knowledge_base/business_definitions.md`
+
+检索策略：**向量召回 + BM25（jieba 分词）→ RRF 融合 → 精排**（默认与向量同模型的双塔余弦；可设 `RAG_RERANK_MODE=cross_encoder` 使用 CrossEncoder）。详见 `docs/rag-retrieval.md`。
 
 ### 5. 启动服务
 

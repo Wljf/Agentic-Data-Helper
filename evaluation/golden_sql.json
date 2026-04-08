@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "description": "与 data_mock.init_warehouse 写入的 Doris 表结构对应；请先完成导数后再跑评测。",
+  "cases": [
+    {
+      "id": "sum_pay_dwd",
+      "question": "请统计订单明细表 dwd_trade_order_detail_di 中实付金额 pay_amount 的总和，只输出一个汇总值。",
+      "expected_sql": "SELECT ROUND(COALESCE(SUM(pay_amount), 0), 2) AS total_pay FROM dwd_trade_order_detail_di",
+      "sql_only_eval": true,
+      "force_pipeline": true,
+      "compare": "result_primary"
+    },
+    {
+      "id": "count_ods",
+      "question": "统计用户行为日志表 ods_log_user_action_di 一共有多少条记录。",
+      "expected_sql": "SELECT COUNT(*) AS cnt FROM ods_log_user_action_di",
+      "sql_only_eval": true,
+      "force_pipeline": true,
+      "compare": "result_primary"
+    },
+    {
+      "id": "ads_gmv_sum",
+      "question": "把 ads_sales_dashboard_di 表里所有日期的 gmv 加总，得到一个总 GMV。",
+      "expected_sql": "SELECT ROUND(COALESCE(SUM(gmv), 0), 2) AS total_gmv FROM ads_sales_dashboard_di",
+      "sql_only_eval": true,
+      "force_pipeline": true,
+      "compare": "result_primary"
+    },
+    {
+      "id": "distinct_orders_dwd",
+      "question": "订单明细表 dwd_trade_order_detail_di 里有多少个不重复的订单号 order_id？",
+      "expected_sql": "SELECT COUNT(DISTINCT order_id) AS order_cnt FROM dwd_trade_order_detail_di",
+      "sql_only_eval": true,
+      "force_pipeline": true,
+      "compare": "result_primary"
+    }
+  ]
+}

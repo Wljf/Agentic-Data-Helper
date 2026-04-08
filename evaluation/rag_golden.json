@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "similarity_threshold": 0.72,
+  "description": "口径类问题与标准答案（由知识库文档人工摘录）；需先执行 knowledge_base.build_rag 构建 Chroma。",
+  "cases": [
+    {
+      "id": "gmv_meaning",
+      "question": "本项目中 GMV 的业务含义是什么？和未支付订单有关系吗？",
+      "ground_truth_answer": "GMV 是成交总额，指统计周期内所有已支付订单的金额总和，不含取消和未支付订单。技术上可对订单明细的 pay_amount 求和，或使用 ADS 看板 ads_sales_dashboard_di 的 gmv 字段。"
+    },
+    {
+      "id": "new_old_user",
+      "question": "怎样区分新用户和老用户？数仓里哪个字段表示？",
+      "ground_truth_answer": "新用户指统计周期内首次在该业务域产生订单的用户；老用户指非首次下单的用户。常用用户首次下单日期判断：若某日等于用户首次下单日则为新客。数仓字段 is_new_user 在 dws_user_trade_summary_nd 表中，1 表示新客，0 表示老客。"
+    },
+    {
+      "id": "atv_define",
+      "question": "客单价 ATV 有哪两种常见算法？",
+      "ground_truth_answer": "常见两种：按订单时 ATV 等于总交易金额除以订单笔数；按用户时某类用户的人均金额等于该类用户总交易金额除以该类去重用户数。新老客客单价需先按 is_new_user 分组再算。"
+    },
+    {
+      "id": "layers",
+      "question": "ODS、DWD、DWS、ADS 四层分别放什么？各举一个表名。",
+      "ground_truth_answer": "ODS 放原始日志等，例如 ods_log_user_action_di；DWD 放明细如 dwd_trade_order_detail_di；DWS 放汇总如 dws_user_trade_summary_nd；ADS 放应用看板如 ads_sales_dashboard_di。"
+    },
+    {
+      "id": "paid_order_count",
+      "question": "已支付订单数在统计上怎么数？用什么字段过滤？",
+      "ground_truth_answer": "统计周期内状态为已支付 PAID 的订单条数；在 dwd_trade_order_di 表用 order_id 计数，过滤条件包含 status 等于 PAID 且 dt 在统计周期内。"
+    }
+  ]
+}

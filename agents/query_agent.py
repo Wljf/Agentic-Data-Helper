@@ -303,25 +303,39 @@ def _rows_to_markdown_table(rows: List[List[Any]]) -> str:
     return "\n".join(table_lines)
 
 
-def _execute_agentic_sql_and_append(answer_text: str) -> str:
+def _execute_agentic_sql_detail(answer_text: str) -> tuple[str, Dict[str, Any]]:
     """
-    对 Agentic RAG 生成的回答进行后处理：
-    - 提取 SQL
-    - 复用安全校验
-    - 执行并取最多 100 行
-    - 将执行结果以 Markdown 表格附加到原回答后
+    Agentic 路径：执行 SQL 并返回 (展示文本, 评估用元数据)。
     """
+    meta: Dict[str, Any] = {
+        "generated_sql": None,
+        "executed_sql": None,
+        "safe_passed": None,
+        "execution_ok": None,
+        "rows": None,
+    }
     sql = _extract_sql_from_text(answer_text)
     if not sql:
-        return answer_text + "\n\n### SQL 执行结果\n未从回答中提取到可执行 SQL。"
+        meta["safe_passed"] = None
+        meta["execution_ok"] = False
+        return (
+            answer_text + "\n\n### SQL 执行结果\n未从回答中提取到可执行 SQL。",
+            meta,
+        )
 
+    meta["generated_sql"] = sql
     if not _is_safe_select_sql(sql):
+        meta["safe_passed"] = False
+        meta["execution_ok"] = False
         return (
             answer_text
             + "\n\n### SQL 执行结果\n"
-            + "检测到 SQL 不符合只读安全规则（仅允许单条 SELECT），已拒绝执行。"
+            + "检测到 SQL 不符合只读安全规则（仅允许单条 SELECT），已拒绝执行。",
+            meta,
         )
 
+    meta["safe_passed"] = True
+    meta["executed_sql"] = sql
     try:
         engine = get_analytics_engine()
         with engine.connect() as conn:
@@ -333,14 +347,31 @@ def _execute_agentic_sql_and_append(answer_text: str) -> str:
         for row in rows:
             table_rows.append([str(v) if v is not None else "" for v in row])
 
+        meta["rows"] = table_rows
+        meta["execution_ok"] = True
         md_table = _rows_to_markdown_table(table_rows)
-        return (
+        out = (
             answer_text
             + "\n\n### SQL 执行结果（最多展示 100 行）\n"
             + md_table
         )
+        return out, meta
     except Exception as e:
-        return answer_text + f"\n\n### SQL 执行结果\n执行失败：{e}"
+        meta["execution_ok"] = False
+        meta["rows"] = None
+        return answer_text + f"\n\n### SQL 执行结果\n执行失败：{e}", meta
+
+
+def _execute_agentic_sql_and_append(answer_text: str) -> str:
+    """
+    对 Agentic RAG 生成的回答进行后处理：
+    - 提取 SQL
+    - 复用安全校验
+    - 执行并取最多 100 行
+    - 将执行结果以 Markdown 表格附加到原回答后
+    """
+    text, _ = _execute_agentic_sql_detail(answer_text)
+    return text
 
 
 def _run_text_to_sql(user_input: str) -> Dict[str, Any]:
@@ -369,6 +400,9 @@ def _run_text_to_sql(user_input: str) -> Dict[str, Any]:
             "sql": generated_sql,
             "executed_sql": safe_sql,
             "rows": [["检测到潜在危险 SQL，已拒绝执行。"]],
+            "safe_passed": False,
+            "execution_attempted": False,
+            "row_count": 0,
         }
 
     # 在 Doris 上执行生成的 SQL（只读查询）
@@ -383,7 +417,14 @@ def _run_text_to_sql(user_input: str) -> Dict[str, Any]:
     for row in rows:
         table_rows.append([str(v) if v is not None else "" for v in row])
 
-    return {"sql": generated_sql, "executed_sql": generated_sql, "rows": table_rows}
+    return {
+        "sql": generated_sql,
+        "executed_sql": generated_sql,
+        "rows": table_rows,
+        "safe_passed": True,
+        "execution_attempted": True,
+        "row_count": len(rows),
+    }
 
 
 def _build_final_answer(
@@ -462,11 +503,43 @@ def run_query_agent(user_input: str) -> str:
     - 若为复杂查数（含对比/口径/新老客/客单价等），走 Agentic RAG（分解 -> 反思 -> 聚合生成 SQL）。
     - 否则：意图识别 -> RAG/元数据/Text-to-SQL -> 整合回答。
     """
-    if run_agentic_rag is not None and _should_use_agentic_rag(user_input):
+    text, _ = run_query_agent_eval(user_input, force_pipeline=False)
+    return text
+
+
+def run_query_agent_eval(
+    user_input: str, *, force_pipeline: bool = False
+) -> tuple[str, Dict[str, Any]]:
+    """
+    供黄金集评测使用：返回 (最终回答文本, 评估元数据)。
+
+    元数据包含生成的 SQL、是否通过只读校验、是否执行成功、结果表（含表头行）。
+    force_pipeline=True 时跳过 Agentic RAG，仅走意图识别 + Text-to-SQL 管线，便于对照标准答案。
+    """
+    detail: Dict[str, Any] = {
+        "path": "",
+        "intent": None,
+        "generated_sql": None,
+        "executed_sql": None,
+        "safe_passed": None,
+        "execution_ok": None,
+        "rows": None,
+    }
+
+    if (
+        run_agentic_rag is not None
+        and not force_pipeline
+        and _should_use_agentic_rag(user_input)
+    ):
         agentic_answer = run_agentic_rag(user_input, max_rounds=3)
-        return _execute_agentic_sql_and_append(agentic_answer)
+        final_text, sql_meta = _execute_agentic_sql_detail(agentic_answer)
+        detail["path"] = "agentic_rag"
+        detail["intent"] = {"forced_agentic": True}
+        detail.update(sql_meta)
+        return final_text, detail
 
     intent_cfg = _classify_query_intent(user_input)
+    detail["intent"] = intent_cfg
     target_table = intent_cfg["target_table"]
 
     definition_md: str | None = None
@@ -481,6 +554,15 @@ def run_query_agent(user_input: str) -> str:
 
     if intent_cfg["need_sql"]:
         sql_result = _run_text_to_sql(user_input)
+        detail["path"] = "pipeline"
+        detail["generated_sql"] = sql_result.get("sql")
+        detail["executed_sql"] = sql_result.get("executed_sql")
+        sp = sql_result.get("safe_passed")
+        detail["safe_passed"] = sp
+        detail["execution_ok"] = bool(sql_result.get("execution_attempted")) and bool(sp)
+        detail["rows"] = sql_result.get("rows")
+    else:
+        detail["path"] = "pipeline_no_sql"
 
     final_answer = _build_final_answer(
         user_input=user_input,
@@ -489,8 +571,41 @@ def run_query_agent(user_input: str) -> str:
         metadata_md=metadata_md,
         sql_result=sql_result,
     )
-    return final_answer
+    return final_answer, detail
 
 
-__all__ = ["run_query_agent"]
+def run_query_agent_sql_only(user_input: str) -> tuple[str, Dict[str, Any]]:
+    """
+    仅走 Text-to-SQL（不跑意图分类、不跑 RAG/元数据），用于黄金集对照标准 SQL。
+
+    固定意图：只生成并执行 SQL，便于稳定复现「生成 SQL vs 标准 SQL」的准确率。
+    """
+    intent_cfg = {
+        "need_definition": False,
+        "need_metadata": False,
+        "need_sql": True,
+        "target_table": "dwd_trade_order_detail_di",
+    }
+    sql_result = _run_text_to_sql(user_input)
+    detail: Dict[str, Any] = {
+        "path": "pipeline_sql_only",
+        "intent": intent_cfg,
+        "generated_sql": sql_result.get("sql"),
+        "executed_sql": sql_result.get("executed_sql"),
+        "safe_passed": sql_result.get("safe_passed"),
+        "execution_ok": bool(sql_result.get("execution_attempted"))
+        and bool(sql_result.get("safe_passed")),
+        "rows": sql_result.get("rows"),
+    }
+    final_answer = _build_final_answer(
+        user_input=user_input,
+        intent_cfg=intent_cfg,
+        definition_md=None,
+        metadata_md=None,
+        sql_result=sql_result,
+    )
+    return final_answer, detail
+
+
+__all__ = ["run_query_agent", "run_query_agent_eval", "run_query_agent_sql_only"]
 
